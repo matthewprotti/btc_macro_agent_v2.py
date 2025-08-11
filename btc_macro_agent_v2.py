@@ -452,9 +452,11 @@ def run(manual: bool = False):
         raise SystemExit("No data available to compute features.")
 
     tgt_date = pd.Timestamp(today_utc.date(), tz=RUN_TZ)
-    signal_date = df.index[df.index.get_loc(tgt_date, method="pad")] if PREDICT_NEXT_DAY else tgt_date
-    if signal_date not in df.index:
-        signal_date = df.index[-1]
+   if PREDICT_NEXT_DAY:
+        idx = df.index.get_indexer([tgt_date], method="pad")[0]
+        signal_date = df.index[idx]
+    else:
+        signal_date = tgt_date
 
     gates = evaluate_gates(df, signal_date)
 

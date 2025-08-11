@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Macro-Tracker Agent - v2.1 (FRED-hardened)
+BTC Macro-Tracker Agent — v2.2 (pandas-safe)
 
-Key fixes in v2.1
-- Robust load_fred_two_col() (handles DATE/observation_date/odd headers; falls back cleanly)
-- WALCL / DFII10 guarded if loader returns empty (no crash; features set to NaN)
-- Binance 451 remains benign (funding = NaN)
+Changes vs v2.1:
+- Replaced DatetimeIndex.get_loc(method="pad") with get_indexer(..., method="pad")
+  + safe fallback when indexer returns -1.
+- Retains robust FRED loader, guarded WALCL/DFII10, benign Binance failures.
 """
 
 import os, io, re, sys, json, hashlib, logging, math
@@ -49,6 +49,7 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
 )
 
+# ------------------------ HTTP + fetch --------------------------------------
 def _http_get(url: str, timeout: int = 20) -> Optional[bytes]:
     try:
         import urllib.request
@@ -80,7 +81,7 @@ SOURCES = [
     ("REALYLD.csv","https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10"),
     ("FUNDING.json","https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1000"),
     ("OPENINT.json","https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"),
-    # Optional locals: data/BIS_GLI.csv (date,global_m2), data/ETF_FLOWS.csv or data/etf_flows.html
+    # Optional locals: data/BIS_GLI.csv ; data/ETF_FLOWS.csv or data/etf_flows.html
 ]
 
 def fetch_all(skip: bool = False):
@@ -108,33 +109,23 @@ def load_stooq_csv(path: str, col_close: str = "Close") -> pd.DataFrame:
     return out.sort_values("date").dropna()
 
 def load_fred_two_col(path: str, value_name: str) -> pd.DataFrame:
-    """
-    Robust CSV loader for FRED graph exports.
-    Accepts DATE/observation_date or falls back to first/last columns.
-    Returns a 2-col frame: ['date', value_name] (may be empty).
-    """
+    """Robust FRED loader → 2 cols ['date', value_name] (may be empty)."""
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return pd.DataFrame(columns=["date", value_name])
-
     try:
         df = pd.read_csv(path)
     except Exception:
         df = pd.read_csv(path, engine="python")
-
     if df.empty:
         return pd.DataFrame(columns=["date", value_name])
 
     cols = [str(c).strip() for c in df.columns]
     df.columns = cols
-
-    # Some FRED files include a descriptive header line; drop fully NaN rows.
     df = df.dropna(how="all")
 
-    # Candidate date columns
+    # Choose date/value columns flexibly
     date_candidates = [c for c in cols if c.lower() in ("date","observation_date") or c.upper().startswith("DATE")]
     date_col = date_candidates[0] if date_candidates else cols[0]
-
-    # Choose a numeric-ish value column
     value_candidates = [c for c in cols if c != date_col]
     val_col = None
     for c in value_candidates:
@@ -148,8 +139,7 @@ def load_fred_two_col(path: str, value_name: str) -> pd.DataFrame:
     out.columns = ["date", value_name]
     out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
     out[value_name] = pd.to_numeric(out[value_name], errors="coerce")
-    out = out.dropna(subset=["date"]).sort_values("date")
-    return out
+    return out.dropna(subset=["date"]).sort_values("date")
 
 def load_bis_gli(path: str) -> pd.DataFrame:
     if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -164,11 +154,12 @@ def load_bis_gli(path: str) -> pd.DataFrame:
     return df.dropna().sort_values("date")
 
 def parse_etf_flows(path_csv_or_html: str) -> pd.DataFrame:
-    """Parse Farside ETF flow table (CSV or saved HTML) → df[date, net_flow]."""
+    """Parse Farside ETF flows (CSV or saved HTML) → df[date, net_flow]."""
     if not os.path.exists(path_csv_or_html) or os.path.getsize(path_csv_or_html) == 0:
         return pd.DataFrame(columns=["date","net_flow"])
     ext = os.path.splitext(path_csv_or_html)[1].lower()
     raw = open(path_csv_or_html, "rb").read()
+
     if ext in (".html",".htm"):
         try:
             tables = pd.read_html(io.BytesIO(raw))
@@ -184,7 +175,7 @@ def parse_etf_flows(path_csv_or_html: str) -> pd.DataFrame:
             if target is None:
                 target = tables[0].copy()
             df = target
-            # heuristic: find date-like column
+            # Find date-like column
             def is_dateish(x: str) -> bool:
                 s = str(x).strip()
                 return bool(re.search(r"\d{1,2}\s+\w+\s+\d{4}", s)) or bool(re.match(r"\d{4}-\d{2}-\d{2}", s))
@@ -237,7 +228,7 @@ def build_features(today_utc: datetime) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     btc = btc.join(dxy["dxy"], how="left")
     btc["dxy_delta"] = btc["dxy"].diff()
 
-    # WALCL weekly delta (guarded)
+    # WALCL (guarded)
     wal = load_fred_two_col(os.path.join(DATA_DIR,"WALCL.csv"), "walcl")
     if wal.empty or "walcl" not in wal.columns:
         btc["fed_delta"] = np.nan
@@ -246,7 +237,7 @@ def build_features(today_utc: datetime) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         wal["fed_delta"] = wal["walcl"].diff()
         btc["fed_delta"] = wal["fed_delta"].reindex(btc.index).ffill()
 
-    # M2 YoY (monthly, forward fill)
+    # M2 YoY (guarded)
     m2 = load_fred_two_col(os.path.join(DATA_DIR,"M2SL.csv"), "m2")
     if not m2.empty and "m2" in m2.columns:
         m2["dm_m2_yoy"] = m2["m2"].pct_change(12)
@@ -282,7 +273,11 @@ def build_features(today_utc: datetime) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     etf["etf_3d"] = etf["net_flow"].rolling(3).sum()
     etf_aligned = etf["etf_3d"].reindex(btc.index).ffill()
     btc["etf_3d"] = etf_aligned
-    diags["etf_3d_stale"] = not pd.notna(etf_aligned.iloc[-1]) or (etf.index.max() is pd.NaT) or (btc.index.max() - etf.index.max() > pd.Timedelta(days=5))
+    diags["etf_3d_stale"] = (
+        not pd.notna(etf_aligned.iloc[-1]) or
+        (etf.index.max() is pd.NaT) or
+        (btc.index.max() - etf.index.max() > pd.Timedelta(days=5))
+    )
 
     # Funding (annualized from last 3 prints)
     annual = np.nan
@@ -386,6 +381,14 @@ def apply_betas(df: pd.DataFrame, betas: Dict[str,float]) -> pd.Series:
     return pd.Series([fitted], index=[df.index[-1]])
 
 # ----------------------- Notifier & utilities -------------------------------
+def _pad_index(index: pd.DatetimeIndex, ts: pd.Timestamp) -> pd.Timestamp:
+    """Return last index value <= ts; fallback to first/last gracefully."""
+    idx = index.get_indexer([ts], method="pad")[0]
+    if idx == -1:
+        # target earlier than first index value
+        return index[0]
+    return index[idx]
+
 def gate_change_alert(prev_gates: Dict[str,int], new_gates: Dict[str,int], date: str) -> Optional[str]:
     changes = []
     for k in ("macro_gate","price_gate","sent_gate"):
@@ -451,12 +454,11 @@ def run(manual: bool = False):
     if df.empty:
         raise SystemExit("No data available to compute features.")
 
-    tgt_date = pd.Timestamp(today_utc.date(), tz=RUN_TZ)
-   if PREDICT_NEXT_DAY:
-        idx = df.index.get_indexer([tgt_date], method="pad")[0]
-        signal_date = df.index[idx]
+    tgt_date = pd.Timestamp(datetime.now(tz=RUN_TZ).date(), tz=RUN_TZ)
+    if PREDICT_NEXT_DAY:
+        signal_date = _pad_index(df.index, tgt_date)
     else:
-        signal_date = tgt_date
+        signal_date = tgt_date if tgt_date in df.index else _pad_index(df.index, tgt_date)
 
     gates = evaluate_gates(df, signal_date)
 

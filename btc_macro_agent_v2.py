@@ -1,21 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Macro-Tracker Agent - v2
+BTC Macro-Tracker Agent - v2.1 (FRED-hardened)
 
-Improvements:
-- Predict ΔlogBTC_t from X_{t-1} (lagged predictors)
-- Robust ETF flows parsing (CSV or saved HTML), 3 trading-day rolling sum
-- Consistent deltas: ΔDXY (levels), Δreal_yld (percentage points)
-- Monday refit with fallback to most-recent complete day (≤3 business days)
-- Idempotent upsert into track.csv + row_hash
-- Gate change notifier hooks (Slack / Telegram / Email) via env vars
-- Extra metadata in track.csv: intercept, refit_date, refit_r2, refit_n,
-  m2_stale_days, etf_3d_stale
-
-Notes:
-- HTTP fetches use urllib (no extra deps). Set SKIP_FETCH=1 to skip network.
-- Defaults to /mnt/data paths; override via env in GitHub Actions.
+Key fixes in v2.1
+- Robust load_fred_two_col() (handles DATE/observation_date/odd headers; falls back cleanly)
+- WALCL / DFII10 guarded if loader returns empty (no crash; features set to NaN)
+- Binance 451 remains benign (funding = NaN)
 """
 
 import os, io, re, sys, json, hashlib, logging, math
@@ -25,7 +16,6 @@ from typing import Optional, Tuple, Dict, Any
 import numpy as np
 import pandas as pd
 
-# Optional: statsmodels for OLS (falls back to numpy if missing)
 try:
     import statsmodels.api as sm
     HAVE_SM = True
@@ -43,8 +33,8 @@ REFIT_WINDOW_DAYS = 180
 GLI_LAG_DAYS = 70
 PREDICT_NEXT_DAY = True  # use X_{t-1} to predict ΔlogBTC_t
 
-# Notifier configuration (all optional)
-SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "").strip()
+# Optional notifiers
+SLACK_WEBHOOK  = os.environ.get("SLACK_WEBHOOK", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT  = os.environ.get("TG_CHAT_ID", "").strip()
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
@@ -90,8 +80,7 @@ SOURCES = [
     ("REALYLD.csv","https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10"),
     ("FUNDING.json","https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1000"),
     ("OPENINT.json","https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"),
-    # Optional local file expected: data/BIS_GLI.csv (date,global_m2)
-    # Optional local file expected: data/ETF_FLOWS.csv or data/etf_flows.html
+    # Optional locals: data/BIS_GLI.csv (date,global_m2), data/ETF_FLOWS.csv or data/etf_flows.html
 ]
 
 def fetch_all(skip: bool = False):
@@ -105,24 +94,28 @@ def fetch_all(skip: bool = False):
 def load_stooq_csv(path: str, col_close: str = "Close") -> pd.DataFrame:
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return pd.DataFrame(columns=["date", "close"])
-    df = pd.read_csv(path)
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        df = pd.read_csv(path, engine="python")
     for c in df.columns:
-        if c.lower().startswith("date"):
+        if str(c).lower().startswith("date"):
             df = df.rename(columns={c: "date"})
-    df["date"] = pd.to_datetime(df["date"], utc=True)
+    if "date" not in df.columns or col_close not in df.columns:
+        return pd.DataFrame(columns=["date","close"])
+    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     out = df[["date", col_close]].rename(columns={col_close: "close"})
     return out.sort_values("date").dropna()
 
 def load_fred_two_col(path: str, value_name: str) -> pd.DataFrame:
     """
-    Robust CSV loader for FRED 'graph' exports.
+    Robust CSV loader for FRED graph exports.
     Accepts DATE/observation_date or falls back to first/last columns.
     Returns a 2-col frame: ['date', value_name] (may be empty).
     """
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return pd.DataFrame(columns=["date", value_name])
 
-    # Try normal parse; if it fails weirdly, try python engine
     try:
         df = pd.read_csv(path)
     except Exception:
@@ -131,25 +124,24 @@ def load_fred_two_col(path: str, value_name: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["date", value_name])
 
-    # Normalize column names to strings
     cols = [str(c).strip() for c in df.columns]
     df.columns = cols
 
+    # Some FRED files include a descriptive header line; drop fully NaN rows.
+    df = df.dropna(how="all")
+
     # Candidate date columns
-    date_candidates = [c for c in cols if c.lower() in ("date", "observation_date") or c.upper().startswith("DATE")]
+    date_candidates = [c for c in cols if c.lower() in ("date","observation_date") or c.upper().startswith("DATE")]
     date_col = date_candidates[0] if date_candidates else cols[0]
 
-    # Pick a value column (prefer numeric-ish)
+    # Choose a numeric-ish value column
     value_candidates = [c for c in cols if c != date_col]
     val_col = None
     for c in value_candidates:
-        # choose the column with most numeric values
         s = pd.to_numeric(df[c], errors="coerce")
-        if s.notna().sum() >= max(1, len(df) // 5):  # at least some numeric density
-            val_col = c
-            break
+        if s.notna().sum() >= max(1, len(df)//5):
+            val_col = c; break
     if val_col is None:
-        # fallback to last column
         val_col = value_candidates[-1] if value_candidates else cols[-1]
 
     out = df[[date_col, val_col]].copy()
@@ -172,17 +164,12 @@ def load_bis_gli(path: str) -> pd.DataFrame:
     return df.dropna().sort_values("date")
 
 def parse_etf_flows(path_csv_or_html: str) -> pd.DataFrame:
-    """
-    Parse Farside ETF flow table (CSV or saved HTML) → df[date, net_flow]
-    Robust to parentheses negatives and dash variants.
-    """
+    """Parse Farside ETF flow table (CSV or saved HTML) → df[date, net_flow]."""
     if not os.path.exists(path_csv_or_html) or os.path.getsize(path_csv_or_html) == 0:
         return pd.DataFrame(columns=["date","net_flow"])
-
     ext = os.path.splitext(path_csv_or_html)[1].lower()
     raw = open(path_csv_or_html, "rb").read()
-
-    if ext in (".html", ".htm"):
+    if ext in (".html",".htm"):
         try:
             tables = pd.read_html(io.BytesIO(raw))
             target = None
@@ -192,12 +179,12 @@ def parse_etf_flows(path_csv_or_html: str) -> pd.DataFrame:
                     if any("total" in str(level).lower() for level in last):
                         target = t.copy(); break
                 else:
-                    if "total" in " ".join(map(str, t.columns)).lower():
+                    if "total" in " ".join(map(str,t.columns)).lower():
                         target = t.copy(); break
             if target is None:
                 target = tables[0].copy()
             df = target
-            # Heuristic: find date-like column
+            # heuristic: find date-like column
             def is_dateish(x: str) -> bool:
                 s = str(x).strip()
                 return bool(re.search(r"\d{1,2}\s+\w+\s+\d{4}", s)) or bool(re.match(r"\d{4}-\d{2}-\d{2}", s))
@@ -225,14 +212,10 @@ def parse_etf_flows(path_csv_or_html: str) -> pd.DataFrame:
         if pd.isna(x): return np.nan
         s = str(x).strip().replace(",", "")
         s = s.replace("–","-").replace("—","-").replace("\u2212","-")
-        if s in ("", "-"):
-            return 0.0
-        if s.startswith("(") and s.endswith(")"):
-            s = "-" + s[1:-1]
-        try:
-            return float(s)
-        except Exception:
-            return np.nan
+        if s in ("","-"): return 0.0
+        if s.startswith("(") and s.endswith(")"): s = "-" + s[1:-1]
+        try: return float(s)
+        except Exception: return np.nan
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True, dayfirst=True)
     df["net_flow"] = df["total"].apply(to_float)
@@ -242,43 +225,32 @@ def parse_etf_flows(path_csv_or_html: str) -> pd.DataFrame:
 def build_features(today_utc: datetime) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     diags: Dict[str, Any] = {}
 
-    btc = load_stooq_csv(os.path.join(DATA_DIR, "BTCUSD.csv")).rename(columns={"close":"btc_close"})
+    btc = load_stooq_csv(os.path.join(DATA_DIR,"BTCUSD.csv")).rename(columns={"close":"btc_close"})
     btc.set_index("date", inplace=True)
     diags["btc_last"] = str(btc.index.max())
 
     btc["btc_50d"] = btc["btc_close"].rolling(50).mean()
     btc["btc_200d"] = btc["btc_close"].rolling(200).mean()
 
-    dxy = load_stooq_csv(os.path.join(DATA_DIR, "DXY.csv")).rename(columns={"close":"dxy"})
+    dxy = load_stooq_csv(os.path.join(DATA_DIR,"DXY.csv")).rename(columns={"close":"dxy"})
     dxy.set_index("date", inplace=True)
     btc = btc.join(dxy["dxy"], how="left")
     btc["dxy_delta"] = btc["dxy"].diff()
 
-   # WALCL weekly delta
-  wal = load_fred_two_col(os.path.join(DATA_DIR, "WALCL.csv"), "walcl")
-  if wal.empty or "walcl" not in wal.columns:
-    btc["fed_delta"] = np.nan
-  else:
-    wal.set_index("date", inplace=True)
-    wal["fed_delta"] = wal["walcl"].diff()
-    wal_ff = wal["fed_delta"].reindex(btc.index).ffill()
-    btc["fed_delta"] = wal_ff
+    # WALCL weekly delta (guarded)
+    wal = load_fred_two_col(os.path.join(DATA_DIR,"WALCL.csv"), "walcl")
+    if wal.empty or "walcl" not in wal.columns:
+        btc["fed_delta"] = np.nan
+    else:
+        wal.set_index("date", inplace=True)
+        wal["fed_delta"] = wal["walcl"].diff()
+        btc["fed_delta"] = wal["fed_delta"].reindex(btc.index).ffill()
 
-# Real yield (DFII10 investment basis), forward fill
-  real = load_fred_two_col(os.path.join(DATA_DIR, "REALYLD.csv"), "real_yld")
-  if real.empty or "real_yld" not in real.columns:
-    btc["real_yld"] = np.nan
-    btc["real_yld_delta"] = np.nan
-  else:
-    real.set_index("date", inplace=True)
-    real = real.reindex(btc.index).ffill()
-    btc["real_yld"] = real["real_yld"]
-    btc["real_yld_delta"] = btc["real_yld"].diff()
-
-    m2 = load_fred_two_col(os.path.join(DATA_DIR, "M2SL.csv"), "m2")
-    if not m2.empty:
+    # M2 YoY (monthly, forward fill)
+    m2 = load_fred_two_col(os.path.join(DATA_DIR,"M2SL.csv"), "m2")
+    if not m2.empty and "m2" in m2.columns:
         m2["dm_m2_yoy"] = m2["m2"].pct_change(12)
-        last_m2_date = m2["date"].max() if "date" in m2.columns else m2.index.max()
+        last_m2_date = m2["date"].max()
         diags["m2_last"] = str(last_m2_date)
         btc["dm_m2_yoy"] = m2.set_index("date")["dm_m2_yoy"].reindex(btc.index).ffill()
         diags["m2_stale_days"] = int((btc.index.max() - last_m2_date).days) if isinstance(last_m2_date, pd.Timestamp) else None
@@ -286,14 +258,20 @@ def build_features(today_utc: datetime) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         btc["dm_m2_yoy"] = np.nan
         diags["m2_stale_days"] = None
 
-    real = load_fred_two_col(os.path.join(DATA_DIR, "REALYLD.csv"), "real_yld")
-    real.set_index("date", inplace=True)
-    btc["real_yld"] = real.reindex(btc.index)["real_yld"].ffill()
-    btc["real_yld_delta"] = btc["real_yld"].diff()
+    # Real yield (guarded)
+    real = load_fred_two_col(os.path.join(DATA_DIR,"REALYLD.csv"), "real_yld")
+    if real.empty or "real_yld" not in real.columns:
+        btc["real_yld"] = np.nan
+        btc["real_yld_delta"] = np.nan
+    else:
+        real.set_index("date", inplace=True)
+        real = real.reindex(btc.index).ffill()
+        btc["real_yld"] = real["real_yld"]
+        btc["real_yld_delta"] = btc["real_yld"].diff()
 
-    # ETF flows (CSV or saved HTML)
-    flows_csv = os.path.join(DATA_DIR, "ETF_FLOWS.csv")
-    flows_html = os.path.join(DATA_DIR, "etf_flows.html")
+    # ETF flows
+    flows_csv  = os.path.join(DATA_DIR,"ETF_FLOWS.csv")
+    flows_html = os.path.join(DATA_DIR,"etf_flows.html")
     if os.path.exists(flows_csv):
         etf = parse_etf_flows(flows_csv)
     elif os.path.exists(flows_html):
@@ -301,21 +279,20 @@ def build_features(today_utc: datetime) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     else:
         etf = pd.DataFrame(columns=["date","net_flow"])
     etf = etf.set_index("date").sort_index()
-    etf["etf_3d"] = etf["net_flow"].rolling(3).sum()  # last 3 trading rows
+    etf["etf_3d"] = etf["net_flow"].rolling(3).sum()
     etf_aligned = etf["etf_3d"].reindex(btc.index).ffill()
     btc["etf_3d"] = etf_aligned
-    etf_stale = pd.isna(etf_aligned.iloc[-1]) or (etf.index.max() is pd.NaT) or (btc.index.max() - etf.index.max() > pd.Timedelta(days=5))
-    diags["etf_3d_stale"] = bool(etf_stale)
+    diags["etf_3d_stale"] = not pd.notna(etf_aligned.iloc[-1]) or (etf.index.max() is pd.NaT) or (btc.index.max() - etf.index.max() > pd.Timedelta(days=5))
 
-    # Funding (annualized from last 3 prints); OI weighting omitted unless you add history
+    # Funding (annualized from last 3 prints)
     annual = np.nan
-    fund_path = os.path.join(DATA_DIR, "FUNDING.json")
+    fund_path = os.path.join(DATA_DIR,"FUNDING.json")
     try:
         if os.path.exists(fund_path) and os.path.getsize(fund_path) > 0:
             arr = json.load(open(fund_path))
             if isinstance(arr, dict): arr = [arr]
             arr = [a for a in arr if "fundingRate" in a]
-            arr.sort(key=lambda x: int(x.get("fundingTime", 0)))
+            arr.sort(key=lambda x: int(x.get("fundingTime",0)))
             last3 = arr[-3:]
             rates = [float(x["fundingRate"]) for x in last3]
             if rates:
@@ -325,7 +302,7 @@ def build_features(today_utc: datetime) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     btc["funding"] = float(annual) if pd.notna(annual) else np.nan
 
     # Global M2 lag (optional)
-    gli = load_bis_gli(os.path.join(DATA_DIR, "BIS_GLI.csv"))
+    gli = load_bis_gli(os.path.join(DATA_DIR,"BIS_GLI.csv"))
     if not gli.empty:
         gli.set_index("date", inplace=True)
         btc["global_m2_lag"] = gli["global_m2"].reindex(btc.index).ffill().shift(GLI_LAG_DAYS)
@@ -345,10 +322,12 @@ def evaluate_gates(df: pd.DataFrame, date: pd.Timestamp) -> Dict[str,int]:
     dxy_ok  = (r["dxy"] < 100) if pd.notna(r["dxy"]) else False
     macro_gate = 1 if (fed_ok + m2_ok + real_ok + dxy_ok) >= 2 else 0
 
-    price_gate = int((r["btc_close"] > r["btc_50d"]) and (r["btc_close"] > r["btc_200d"])) if pd.notna(r["btc_50d"]) and pd.notna(r["btc_200d"]) else 0
+    price_gate = 0
+    if pd.notna(r.get("btc_50d")) and pd.notna(r.get("btc_200d")):
+        price_gate = int((r["btc_close"] > r["btc_50d"]) and (r["btc_close"] > r["btc_200d"]))
 
     sent_gate = 0
-    if pd.notna(r["etf_3d"]) and pd.notna(r["funding"]):
+    if pd.notna(r.get("etf_3d")) and pd.notna(r.get("funding")):
         sent_gate = 1 if (r["etf_3d"] >= 250) and (r["funding"] <= 0.15) else 0
 
     return {"macro_gate": macro_gate, "price_gate": price_gate, "sent_gate": sent_gate}
@@ -370,18 +349,15 @@ def fit_regression(df: pd.DataFrame, refit_day: pd.Timestamp):
     end = refit_day
     start = end - pd.Timedelta(days=REFIT_WINDOW_DAYS)
     window = df.loc[(df.index >= start) & (df.index <= end)].copy()
-
     y = np.log(window["btc_close"]).diff()
     X = window[["dm_m2_yoy","dxy_delta","real_yld_delta","etf_3d","global_m2_lag"]].shift(1)
     D = pd.concat([y, X], axis=1).dropna()
     if D.empty or D.shape[0] < 30:
         return {}, {"refit_date": None, "refit_n": int(D.shape[0])}
-
     Y = D.iloc[:,0].values
     Xmat = D.iloc[:,1:].values
     names = D.columns[1:].tolist()
     meta = {"refit_date": str(end.date()), "refit_n": int(D.shape[0])}
-
     if HAVE_SM:
         Xsm = sm.add_constant(Xmat)
         model = sm.OLS(Y, Xsm).fit(cov_type="HAC", cov_kwds={"maxlags":5})
@@ -392,10 +368,8 @@ def fit_regression(df: pd.DataFrame, refit_day: pd.Timestamp):
         beta_vec = np.linalg.lstsq(Xols, Y, rcond=None)[0]
         betas = dict(zip(["intercept"] + names, beta_vec.tolist()))
         yhat = Xols @ beta_vec
-        ssr = float(np.sum((Y - yhat)**2))
-        sst = float(np.sum((Y - np.mean(Y))**2))
+        ssr = float(np.sum((Y - yhat)**2)); sst = float(np.sum((Y - np.mean(Y))**2))
         meta["refit_r2"] = 1.0 - ssr/sst if sst > 0 else np.nan
-
     return betas, meta
 
 def apply_betas(df: pd.DataFrame, betas: Dict[str,float]) -> pd.Series:
@@ -423,7 +397,6 @@ def gate_change_alert(prev_gates: Dict[str,int], new_gates: Dict[str,int], date:
 
 def send_alert(msg: str):
     sent = False
-    # Slack
     if SLACK_WEBHOOK:
         try:
             import urllib.request, json as _json
@@ -433,7 +406,6 @@ def send_alert(msg: str):
             sent = True
         except Exception as e:
             logging.warning(f"Slack alert failed: {e}")
-    # Telegram
     if (not sent) and TELEGRAM_TOKEN and TELEGRAM_CHAT:
         try:
             import urllib.parse, urllib.request
@@ -444,7 +416,6 @@ def send_alert(msg: str):
             sent = True
         except Exception as e:
             logging.warning(f"Telegram alert failed: {e}")
-    # Email
     if (not sent) and SMTP_HOST and ALERT_EMAIL_TO:
         try:
             import smtplib
@@ -456,10 +427,8 @@ def send_alert(msg: str):
             em.set_content(msg)
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
                 s.starttls()
-                if SMTP_USER and SMTP_PASS:
-                    s.login(SMTP_USER, SMTP_PASS)
-                s.send_message(em)
-                sent = True
+                if SMTP_USER and SMTP_PASS: s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(em); sent = True
         except Exception as e:
             logging.warning(f"Email alert failed: {e}")
     if not sent:
@@ -467,10 +436,8 @@ def send_alert(msg: str):
         logging.info(msg)
 
 def row_hash(d: Dict[str,Any]) -> str:
-    keys = [
-        "btc_close","fed_delta","dm_m2_yoy","dxy","real_yld","etf_3d","funding",
-        "btc_50d","btc_200d","macro_gate","price_gate","sent_gate"
-    ]
+    keys = ["btc_close","fed_delta","dm_m2_yoy","dxy","real_yld","etf_3d","funding",
+            "btc_50d","btc_200d","macro_gate","price_gate","sent_gate"]
     payload = "|".join(str(d.get(k,"")) for k in keys)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
@@ -491,8 +458,7 @@ def run(manual: bool = False):
 
     gates = evaluate_gates(df, signal_date)
 
-    betas = {}
-    meta  = {"refit_date": None, "refit_n": None, "refit_r2": None}
+    betas = {}; meta  = {"refit_date": None, "refit_n": None, "refit_r2": None}
     if refit_needed(today_utc) or manual:
         refit_day = last_complete_day_for_refit(df, today_utc)
         if refit_day is not None:
@@ -543,8 +509,7 @@ def run(manual: bool = False):
                 if len(track) >= 1:
                     last_row = track.iloc[-1].to_dict()
                     for k in ("macro_gate","price_gate","sent_gate"):
-                        if k in last_row:
-                            prev_gates[k] = int(last_row.get(k))
+                        if k in last_row: prev_gates[k] = int(last_row.get(k))
             else:
                 track = pd.DataFrame(columns=list(row.keys()))
         except Exception:
@@ -552,8 +517,7 @@ def run(manual: bool = False):
     else:
         track = pd.DataFrame(columns=list(row.keys()))
 
-    track = pd.concat([track, pd.DataFrame([row])], ignore_index=True)
-    track = track.reindex(columns=list(row.keys()))
+    track = pd.concat([track, pd.DataFrame([row])], ignore_index=True).reindex(columns=list(row.keys()))
     track.to_csv(TRACK_CSV, index=False)
     logging.info(f"Appended row for {row['date']} → {TRACK_CSV}")
 

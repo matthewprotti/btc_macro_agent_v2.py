@@ -254,10 +254,26 @@ def build_features(today_utc: datetime) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     btc = btc.join(dxy["dxy"], how="left")
     btc["dxy_delta"] = btc["dxy"].diff()
 
-    wal = load_fred_two_col(os.path.join(DATA_DIR, "WALCL.csv"), "walcl")
+   # WALCL weekly delta
+  wal = load_fred_two_col(os.path.join(DATA_DIR, "WALCL.csv"), "walcl")
+  if wal.empty or "walcl" not in wal.columns:
+    btc["fed_delta"] = np.nan
+  else:
     wal.set_index("date", inplace=True)
     wal["fed_delta"] = wal["walcl"].diff()
-    btc["fed_delta"] = wal["fed_delta"].reindex(btc.index).ffill()
+    wal_ff = wal["fed_delta"].reindex(btc.index).ffill()
+    btc["fed_delta"] = wal_ff
+
+# Real yield (DFII10 investment basis), forward fill
+  real = load_fred_two_col(os.path.join(DATA_DIR, "REALYLD.csv"), "real_yld")
+  if real.empty or "real_yld" not in real.columns:
+    btc["real_yld"] = np.nan
+    btc["real_yld_delta"] = np.nan
+  else:
+    real.set_index("date", inplace=True)
+    real = real.reindex(btc.index).ffill()
+    btc["real_yld"] = real["real_yld"]
+    btc["real_yld_delta"] = btc["real_yld"].diff()
 
     m2 = load_fred_two_col(os.path.join(DATA_DIR, "M2SL.csv"), "m2")
     if not m2.empty:

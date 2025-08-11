@@ -114,15 +114,50 @@ def load_stooq_csv(path: str, col_close: str = "Close") -> pd.DataFrame:
     return out.sort_values("date").dropna()
 
 def load_fred_two_col(path: str, value_name: str) -> pd.DataFrame:
+    """
+    Robust CSV loader for FRED 'graph' exports.
+    Accepts DATE/observation_date or falls back to first/last columns.
+    Returns a 2-col frame: ['date', value_name] (may be empty).
+    """
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return pd.DataFrame(columns=["date", value_name])
-    df = pd.read_csv(path)
-    date_col = [c for c in df.columns if c.upper().startswith("DATE")]
-    val_col  = [c for c in df.columns if c != date_col[0]][0] if date_col else df.columns[-1]
-    df = df.rename(columns={date_col[0]: "date", val_col: value_name})
-    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-    df[value_name] = pd.to_numeric(df[value_name], errors="coerce")
-    return df.dropna(subset=["date"]).sort_values("date")
+
+    # Try normal parse; if it fails weirdly, try python engine
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        df = pd.read_csv(path, engine="python")
+
+    if df.empty:
+        return pd.DataFrame(columns=["date", value_name])
+
+    # Normalize column names to strings
+    cols = [str(c).strip() for c in df.columns]
+    df.columns = cols
+
+    # Candidate date columns
+    date_candidates = [c for c in cols if c.lower() in ("date", "observation_date") or c.upper().startswith("DATE")]
+    date_col = date_candidates[0] if date_candidates else cols[0]
+
+    # Pick a value column (prefer numeric-ish)
+    value_candidates = [c for c in cols if c != date_col]
+    val_col = None
+    for c in value_candidates:
+        # choose the column with most numeric values
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().sum() >= max(1, len(df) // 5):  # at least some numeric density
+            val_col = c
+            break
+    if val_col is None:
+        # fallback to last column
+        val_col = value_candidates[-1] if value_candidates else cols[-1]
+
+    out = df[[date_col, val_col]].copy()
+    out.columns = ["date", value_name]
+    out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+    out[value_name] = pd.to_numeric(out[value_name], errors="coerce")
+    out = out.dropna(subset=["date"]).sort_values("date")
+    return out
 
 def load_bis_gli(path: str) -> pd.DataFrame:
     if not os.path.exists(path) or os.path.getsize(path) == 0:

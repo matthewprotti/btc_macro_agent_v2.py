@@ -23,6 +23,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy lxml html5lib beautifulsoup4 statsmodels
 
+      - name: List workspace
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 2 -type f | sort
+
       - name: Run tracker
         env:
           BTC_MACRO_DATA_DIR: ${{ github.workspace }}/data

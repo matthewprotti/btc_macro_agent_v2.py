@@ -455,10 +455,11 @@ def run(manual: bool = False):
         raise SystemExit("No data available to compute features.")
 
     tgt_date = pd.Timestamp(datetime.now(tz=RUN_TZ).date(), tz=RUN_TZ)
-    if PREDICT_NEXT_DAY:
-        signal_date = _pad_index(df.index, tgt_date)
-    else:
-        signal_date = tgt_date if tgt_date in df.index else _pad_index(df.index, tgt_date)
+  if PREDICT_NEXT_DAY:
+      # Use asof to get the closest date less than or equal to tgt_date
+      signal_date = df.index.asof(tgt_date)
+  else:
+      signal_date = tgt_date
 
     gates = evaluate_gates(df, signal_date)
 

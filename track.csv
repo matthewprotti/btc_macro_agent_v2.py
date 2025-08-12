@@ -1,2 +1,3 @@
 date,btc_close,macro_gate,price_gate,sent_gate,fed_delta,dm_m2_yoy,dxy,real_yld,etf_3d,funding,btc_50d,btc_200d,fitted_price,beta_dm2,beta_dxy,beta_real,beta_etf,beta_gm2,intercept,refit_date,refit_r2,refit_n,m2_stale_days,etf_3d_stale,row_hash
 2025-08-11,118601.0,0,1,0,-1735.0,0.0421953,,1.88,,,111594.62,98196.261,,,,,,,,,,,72,1,81510c86e0b7
+2025-08-12,119853.0,0,1,0,-1735.0,0.0421953,,1.87,,,111885.04,98444.2815,,,,,,,,,,,73,1,2c03b3e53fd2

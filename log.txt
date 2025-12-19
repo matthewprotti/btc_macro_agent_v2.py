@@ -2060,3 +2060,19 @@
 2025-12-18 23:43:19,226 WARNING Retry 2 failed: https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT
 2025-12-18 23:43:19,226 ERROR Writing empty file after failures: /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/data/OPENINT.json
 2025-12-18 23:43:19,276 INFO Appended row for 2025-12-18 → /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/track.csv
+2025-12-19 23:42:12,706 INFO Fetched https://stooq.com/q/d/l/?s=btcusd&i=d → /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/data/BTCUSD.csv (160314 bytes)
+2025-12-19 23:42:14,428 INFO Fetched https://stooq.com/q/d/l/?s=dx.c&i=d → /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/data/DXY.csv (454520 bytes)
+2025-12-19 23:42:14,992 INFO Fetched https://fred.stlouisfed.org/graph/fredgraph.csv?id=WALCL → /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/data/WALCL.csv (22541 bytes)
+2025-12-19 23:42:15,371 INFO Fetched https://fred.stlouisfed.org/graph/fredgraph.csv?id=M2SL → /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/data/M2SL.csv (14417 bytes)
+2025-12-19 23:42:16,577 INFO Fetched https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10 → /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/data/REALYLD.csv (95851 bytes)
+2025-12-19 23:42:16,652 WARNING HTTP GET failed for https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1000: HTTP Error 451: 
+2025-12-19 23:42:16,653 WARNING Retry 1 failed: https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1000
+2025-12-19 23:42:16,698 WARNING HTTP GET failed for https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1000: HTTP Error 451: 
+2025-12-19 23:42:16,698 WARNING Retry 2 failed: https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1000
+2025-12-19 23:42:16,699 ERROR Writing empty file after failures: /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/data/FUNDING.json
+2025-12-19 23:42:16,737 WARNING HTTP GET failed for https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT: HTTP Error 451: 
+2025-12-19 23:42:16,738 WARNING Retry 1 failed: https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT
+2025-12-19 23:42:16,788 WARNING HTTP GET failed for https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT: HTTP Error 451: 
+2025-12-19 23:42:16,789 WARNING Retry 2 failed: https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT
+2025-12-19 23:42:16,789 ERROR Writing empty file after failures: /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/data/OPENINT.json
+2025-12-19 23:42:16,842 INFO Appended row for 2025-12-19 → /home/runner/work/macro_agent_v2.py/macro_agent_v2.py/track.csv
